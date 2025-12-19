@@ -1,37 +1,44 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Scheduled Worker: a Worker that can run on a
- * configurable interval:
- * https://developers.cloudflare.com/workers/platform/triggers/cron-triggers/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Run `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import puppeteer from "@cloudflare/puppeteer";
 
 export default {
-	async fetch(req) {
-		const url = new URL(req.url)
-		url.pathname = "/__scheduled";
-		url.searchParams.append("cron", "* * * * *");
-		return new Response(`To test the scheduled handler, ensure you have used the "--test-scheduled" then try running "curl ${url.href}".`);
-	},
+  async scheduled(event, env, ctx) {
+    // 1. Launch Browser & Scrape
+    const browser = await puppeteer.launch(env.MY_BROWSER);
+    const page = await browser.newPage();
+    await page.goto("https://zealy.io/cw/wintersupercycle/questboard/sprints");
+    await page.waitForSelector('div[role="button"]', { timeout: 10000 });
+    
+    const currentQuestsText = await page.evaluate(() => document.body.innerText);
+    await browser.close();
 
-	// The scheduled handler is invoked at the interval set in our wrangler.jsonc's
-	// [[triggers]] configuration.
-	async scheduled(event, env, ctx) {
-		// A Cron Trigger can make requests to other endpoints on the Internet,
-		// publish to a Queue, query a D1 Database, and much more.
-		//
-		// We'll keep it simple and make an API call to a Cloudflare API:
-		let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-		let wasSuccessful = resp.ok ? 'success' : 'fail';
+    // 2. Fetch Previous State from Database
+    const previousQuests = await env.ZEALY_KV.get("last_scrape");
 
-		// You could store this result in KV, write to a D1 Database, or publish to a Queue.
-		// In this template, we'll just log the result:
-		console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
-	},
+    // 3. Use Gemini to Compare and Alert
+    const prompt = `
+      You are a specialized Zealy task monitor. 
+      PREVIOUS DATA: ${previousQuests || "None"}
+      CURRENT DATA: ${currentQuestsText.substring(0, 4000)}
+      
+      Tasks: 
+      1. Identify if any NEW tasks have appeared.
+      2. If new tasks exist, list them with XP.
+      3. Return ONLY a JSON object: {"new_tasks_found": true/false, "new_tasks": []}
+    `;
+
+    const geminiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+
+    const result = await geminiResp.json();
+    const analysis = JSON.parse(result.candidates[0].content.parts[0].text);
+
+    // 4. Action: Update DB and Notify if changed
+    if (analysis.new_tasks_found) {
+      console.log("New tasks detected!", analysis.new_tasks);
+      // Optional: Insert Discord Webhook fetch() here to get a notification on your phone
+      await env.ZEALY_KV.put("last_scrape", currentQuestsText);
+    }
+  }
 };
